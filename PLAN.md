@@ -42,25 +42,24 @@ con Full (strict) Cloudflare siempre conecta al origen por 443, y la redirecció
 2. Anotar la IP de la VPS y el acceso root/contraseña que dio el proveedor.
 
 **En el proveedor de la VPS**
-3. Snapshot inicial (punto de retorno si algo sale mal).
+3. Sin snapshots (costo extra): la consola web/VNC es el único plan de rescate, hay que probarla.
 4. Si el proveedor tiene firewall de red, dejar solo 22 y 443 (defensa en profundidad).
-5. Tener a mano la consola web/VNC del proveedor: es la salida de emergencia si te bloqueas por SSH.
 
 **En Cloudflare**
-6. DNS: registros `A`/`AAAA` del dominio y subdominios **con proxy (naranja)**. Ningún registro gris
+5. DNS: registros `A`/`AAAA` del dominio y subdominios **con proxy (naranja)**. Ningún registro gris
    apuntando a la IP de la VPS (revelaría el origen). Para SSH usa la IP directa, no un subdominio.
-7. SSL/TLS → modo **Full (strict)**.
-8. SSL/TLS → Origin Server → crear certificado **Origin CA** para `dominio.com` y `*.dominio.com`
+6. SSL/TLS → modo **Full (strict)**.
+7. SSL/TLS → Origin Server → crear certificado **Origin CA** para `dominio.com` y `*.dominio.com`
    (vale 15 años). Guardar el `.pem` y la `.key` de forma segura; se suben a la VPS en la Fase 3.
-9. Activar **Authenticated Origin Pulls** (antes de que nginx lo exija, o los sitios darán 400).
-10. Edge Certificates: Always Use HTTPS, TLS mínimo 1.2, TLS 1.3 activo.
+8. Activar **Authenticated Origin Pulls** (antes de que nginx lo exija, o los sitios darán 400).
+9. Edge Certificates: Always Use HTTPS, TLS mínimo 1.2, TLS 1.3 activo.
     HSTS se activa al final, cuando todo funcione por HTTPS.
-11. Seguridad: Managed Ruleset gratuito activo, Bot Fight Mode (ojo con APIs y webhooks),
+10. Seguridad: Managed Ruleset gratuito activo, Bot Fight Mode (ojo con APIs y webhooks),
     una regla de rate limiting para rutas de login, y una regla que bloquee ruido típico
     (`/.env`, `/.git`, `/wp-admin`, `/xmlrpc.php`).
-12. Correo: no montar servidor de correo en la VPS. Usar un proveedor transaccional (Resend, Postmark, SES).
+11. Correo: no montar servidor de correo en la VPS. Usar un proveedor transaccional (Resend, Postmark, SES).
 
-**Resultado:** llave SSH lista, snapshot hecho, Cloudflare configurado y certificado Origin CA guardado.
+**Resultado:** llave SSH lista, consola web probada, Cloudflare configurado y certificado Origin CA guardado.
 
 ---
 
@@ -70,7 +69,7 @@ Objetivo: entrar a la VPS desde tu computadora con tu propia llave, con un usuar
 y cerrar el acceso de root y por contraseña.
 
 1. Primer ingreso como root (con lo que dio el proveedor) y actualización completa del sistema.
-2. Crear el usuario admin (ej. `orlando`), agregarlo a `sudo` y a un grupo `sshusers`,
+2. Crear el usuario admin (ej. `admin`), agregarlo a `sudo` y a un grupo `sshusers`,
    ponerle contraseña (solo se usa para sudo, nunca para SSH).
 3. Copiar tu llave pública a `~/.ssh/authorized_keys` del admin.
 4. **Probar el login con la llave en una terminal nueva, sin cerrar la sesión de root.**
@@ -194,8 +193,7 @@ La idea es tener un script que cree todo esto con un solo comando por app.
 1. Dump diario de cada base de datos (`pg_dump` / `mariadb-dump`) con retención local de 7 días (timer de systemd).
 2. Copia externa cifrada con **restic** hacia **Cloudflare R2** (u otro S3): dumps + `/var/www/*/shared` + `/etc`.
    Retención: 7 diarios, 4 semanales, 6 mensuales.
-3. Snapshots periódicos del proveedor como capa extra.
-4. **Probar una restauración** al terminar y luego cada trimestre. Un backup no probado no es backup.
+3. **Probar una restauración** al terminar y luego cada trimestre. Un backup no probado no es backup.
 
 ---
 
