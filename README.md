@@ -7,8 +7,8 @@ Cada fase registra qué se hizo, los comandos usados y cómo se verificó.
 |------|--------|
 | 0. Preparación (llave SSH, proveedor, Cloudflare) | Validada |
 | 1. Acceso SSH seguro | Validada |
-| 2. Sistema base | Pendiente |
-| 3. Firewall y fail2ban | Pendiente |
+| 2. Sistema base | Validada |
+| 3. Firewall y fail2ban | Validada |
 | 4. Stack web | Pendiente |
 | 5. Bases de datos | Pendiente |
 | 6. Estructura por app | Pendiente |
@@ -416,6 +416,553 @@ Los demás siguen funcionando.
 - [ ] Login con contraseña → `Permission denied (publickey)`.
 - [ ] `sshd -T` muestra los valores esperados.
 - [ ] Sin usuarios por defecto del proveedor (`getent passwd 1000` no devuelve nada).
+
+---
+
+## Fase 2 — Sistema base
+
+Objetivo: dejar el sistema con herramientas básicas, hora correcta, swap, kernel endurecido,
+logs con límite y parches de seguridad automáticos.
+
+Todos los comandos se ejecutan en la VPS como `USUARIO_ADMIN` (con `sudo`).
+
+> En Debian, herramientas de administración como `sysctl`, `swapon` o `sshd` están en `/usr/sbin`, que no
+> está en el `PATH` de un usuario normal. Si sale `command not found`, anteponer `sudo`.
+
+### 2.1 Paquetes base
+
+```bash
+sudo apt update
+sudo apt install -y curl git unzip rsync htop ca-certificates gnupg
+```
+
+### 2.2 Hora del sistema
+
+El servidor trabaja en **UTC** (logs y tareas programadas sin cambios de horario). Revisar:
+
+```bash
+timedatectl
+```
+
+Debe mostrar `Time zone: Etc/UTC` (o `UTC`), `System clock synchronized: yes` y `NTP service: active`.
+Si la zona es otra:
+
+```bash
+sudo timedatectl set-timezone UTC
+```
+
+### 2.3 Swap de 2 GB
+
+Con 2 GB de RAM, la swap evita que el sistema mate procesos (PHP, Node, bases de datos) en picos de memoria.
+Revisar si ya existe:
+
+```bash
+sudo swapon --show
+free -h
+```
+
+`swapon` está en `/usr/sbin`, fuera del `PATH` de un usuario normal en Debian: siempre con `sudo`.
+
+Si ya existe swap (algunos proveedores, como Vultr, la crean al instalar) **no crear otra**: basta con
+que haya ~2 GB y comprobar que arranca sola y solo root la lee:
+
+```bash
+grep swap /etc/fstab
+ls -l /swapfile
+```
+
+Esperado: una línea con `/swapfile` en `fstab` y permisos `-rw------- root root`.
+
+Si `sudo swapon --show` no imprime nada, crearla:
+
+```bash
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+- `chmod 600`: la swap puede contener datos de memoria (contraseñas, sesiones); solo root la lee.
+- La línea en `/etc/fstab` la activa en cada arranque.
+
+### 2.4 Endurecer el kernel (sysctl)
+
+```bash
+sudo nano /etc/sysctl.d/99-hardening.conf
+```
+
+Contenido:
+
+```
+# Red: anti-spoofing, sin redirects ni source routing, SYN cookies
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.tcp_syncookies = 1
+
+# Kernel: ocultar direcciones de memoria y dmesg a usuarios sin privilegios, limitar ptrace
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.yama.ptrace_scope = 1
+
+# Memoria: usar la swap solo como respaldo
+vm.swappiness = 10
+```
+
+Aplicar (sin reiniciar):
+
+```bash
+sudo sysctl --system
+```
+
+Revisar que no haya errores en la salida y comprobar un par de valores:
+
+```bash
+sudo sysctl vm.swappiness net.ipv4.tcp_syncookies kernel.kptr_restrict
+```
+
+Esperado: `vm.swappiness = 10`, `net.ipv4.tcp_syncookies = 1`, `kernel.kptr_restrict = 2`.
+
+### 2.5 Límite de tamaño de los logs
+
+Debian 13 no instala rsyslog: los logs viven en el journal (`journalctl`). Limitarlos para no llenar el disco:
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo nano /etc/systemd/journald.conf.d/size.conf
+```
+
+Contenido:
+
+```
+[Journal]
+SystemMaxUse=200M
+```
+
+Aplicar y comprobar:
+
+```bash
+sudo systemctl restart systemd-journald
+sudo journalctl --disk-usage
+```
+
+Un usuario normal solo ve sus propios logs: para revisar los del sistema usar siempre `sudo journalctl ...`.
+
+### 2.6 Parches de seguridad automáticos
+
+```bash
+sudo apt install -y unattended-upgrades apt-listchanges needrestart
+```
+
+- `unattended-upgrades`: instala solo las actualizaciones de **seguridad** de Debian, todos los días.
+- `needrestart`: tras actualizar, reinicia los servicios que usaban librerías viejas.
+
+Crear la configuración local:
+
+```bash
+sudo nano /etc/apt/apt.conf.d/52local-unattended
+```
+
+Contenido:
+
+```
+// Buscar e instalar parches de seguridad cada día
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+// Reinicio cuando un parche lo requiera (kernel, librerías base).
+// "true" = automático a la hora indicada (UTC). "false" = manual.
+Unattended-Upgrade::Automatic-Reboot "REINICIO_AUTOMATICO";
+Unattended-Upgrade::Automatic-Reboot-Time "10:00";
+```
+
+Reemplazar `REINICIO_AUTOMATICO` por `true` o `false`.
+
+La hora está en **UTC**: convertir desde la hora local de menor tráfico (ejemplo: 04:00 en UTC−6 = `10:00`).
+
+- **true**: el servidor se reinicia solo a esa hora cuando hace falta (~1 minuto sin servicio).
+- **false**: reiniciar manualmente. Para saber si hay un reinicio pendiente:
+  ```bash
+  ls /var/run/reboot-required
+  ```
+  Si el archivo existe, reiniciar con `sudo reboot` en un horario conveniente.
+
+Que `needrestart` reinicie servicios sin preguntar (si no, se queda esperando una respuesta que nadie da):
+
+```bash
+echo "\$nrconf{restart} = 'a';" | sudo tee /etc/needrestart/conf.d/auto.conf
+```
+
+Probar en modo simulación (no instala nada; revisar que no haya errores):
+
+```bash
+sudo unattended-upgrade --dry-run --debug 2>&1 | tail -20
+```
+
+Comprobar que los temporizadores están activos:
+
+```bash
+systemctl list-timers apt-daily.timer apt-daily-upgrade.timer
+```
+
+Salir con `q` si la lista queda en pantalla. El reinicio automático solo ocurre si existe `/var/run/reboot-required`
+(lo crea un parche que lo necesita), no a diario.
+
+### Verificación de la Fase 2
+
+- [ ] `timedatectl` → UTC y reloj sincronizado.
+- [ ] `sudo swapon --show` → una swap de ~2 GB (la del proveedor o `/swapfile`).
+- [ ] `sudo sysctl vm.swappiness` → `10`.
+- [ ] `sudo journalctl --disk-usage` → por debajo de 200M.
+- [ ] `unattended-upgrade --dry-run` sin errores y temporizadores `apt-daily*` activos.
+
+---
+
+## Fase 3 — Firewall y protección contra fuerza bruta
+
+Objetivo: dejar abiertos solo el **22** (SSH) y el **443** (únicamente desde Cloudflare), y bloquear
+automáticamente a quien insista en adivinar el acceso SSH.
+
+Este firewall es la **segunda capa**: el firewall de Vultr (Fase 0) ya filtra antes de llegar a la VPS.
+
+> **Riesgo:** una regla mal escrita puede dejarte sin SSH. Por eso las reglas se prueban primero con un
+> **temporizador de reversión** que las borra solo a los 5 minutos, y solo se hacen permanentes cuando
+> se comprueba el acceso desde otra terminal. Plan de rescate: consola web del proveedor.
+
+Todos los comandos son en la VPS como `USUARIO_ADMIN`.
+
+### 3.1 Instalar nftables y quitar UFW
+
+nftables es el firewall nativo de Debian 13.
+
+```bash
+sudo apt install -y nftables
+```
+
+Todavía no activar el servicio.
+
+Algunas imágenes (Vultr, entre otras) traen **UFW activo**, solo con el 22 abierto. Dos firewalls a la vez
+se estorban: cada paquete debe pasar por ambos y UFW descartaría el 443 de Cloudflare. Revisar:
+
+```bash
+sudo ufw status verbose
+```
+
+Si dice `Status: active`, desactivarlo, comprobar que `ssh vps` sigue entrando desde otra terminal y
+desinstalarlo para que nftables sea el único firewall del servidor:
+
+```bash
+sudo ufw disable
+```
+
+```bash
+sudo apt purge -y ufw
+```
+
+### 3.2 Script que descarga los rangos IP de Cloudflare
+
+Las IPs de Cloudflare cambian de vez en cuando, así que se descargan con un script en lugar de copiarlas a mano.
+El script valida las listas antes de usarlas, para no dejar el 443 cerrado por una descarga rota.
+
+```bash
+sudo nano /usr/local/sbin/cloudflare-ips
+```
+
+Contenido:
+
+```bash
+#!/bin/bash
+# Descarga los rangos IP de Cloudflare y genera /etc/nftables.d/cloudflare.nft
+set -euo pipefail
+
+OUT=/etc/nftables.d/cloudflare.nft
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+
+v4=$(curl -fsS --max-time 20 https://www.cloudflare.com/ips-v4)
+v6=$(curl -fsS --max-time 20 https://www.cloudflare.com/ips-v6)
+
+# Validar antes de tocar nada: solo CIDRs y una cantidad mínima de rangos
+check() { # $1=lista $2=regex $3=mínimo de líneas
+  [ "$(printf '%s\n' "$1" | grep -cvE "$2")" -eq 0 ] && [ "$(printf '%s\n' "$1" | wc -l)" -ge "$3" ]
+}
+check "$v4" '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' 5 || { echo "Lista IPv4 inválida" >&2; exit 1; }
+check "$v6" '^[0-9a-fA-F:]+/[0-9]{1,3}$' 3 || { echo "Lista IPv6 inválida" >&2; exit 1; }
+
+{
+  echo "define CF_V4 = { $(printf '%s\n' "$v4" | paste -sd, - | sed 's/,/, /g') }"
+  echo "define CF_V6 = { $(printf '%s\n' "$v6" | paste -sd, - | sed 's/,/, /g') }"
+} > "$TMP"
+
+mkdir -p /etc/nftables.d
+[ -f "$OUT" ] && cp "$OUT" "$OUT.bak"
+install -m 644 "$TMP" "$OUT"
+
+# Si el firewall ya está activo: validar y recargar; si falla, restaurar la lista anterior
+if systemctl is-active --quiet nftables; then
+  if nft -c -f /etc/nftables.conf; then
+    systemctl reload nftables
+  else
+    [ -f "$OUT.bak" ] && mv "$OUT.bak" "$OUT"
+    echo "Configuración inválida, se restauró la lista anterior" >&2
+    exit 1
+  fi
+fi
+```
+
+Darle permisos, ejecutarlo y revisar el resultado:
+
+```bash
+sudo chmod 750 /usr/local/sbin/cloudflare-ips
+sudo /usr/local/sbin/cloudflare-ips
+cat /etc/nftables.d/cloudflare.nft
+```
+
+Deben aparecer dos líneas: `define CF_V4 = { ... }` y `define CF_V6 = { ... }` con los rangos.
+
+### 3.3 Reglas del firewall
+
+Guardar el archivo original por si hace falta volver atrás:
+
+```bash
+sudo cp /etc/nftables.conf /etc/nftables.conf.orig
+sudo nano /etc/nftables.conf
+```
+
+Reemplazar **todo** el contenido por:
+
+```
+#!/usr/sbin/nft -f
+# Política por defecto: descartar todo lo entrante.
+# SSH abierto (protegido por llave + fail2ban); HTTPS solo desde Cloudflare.
+# El puerto 80 no se abre: con SSL Full (strict) Cloudflare siempre conecta por 443.
+
+include "/etc/nftables.d/cloudflare.nft"
+
+# Declarar + borrar + recrear la tabla es atómico y no toca las tablas de fail2ban
+# (por eso no se usa "flush ruleset").
+table inet filter
+delete table inet filter
+
+table inet filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state established,related accept
+        ct state invalid drop
+        iif lo accept
+
+        # IPv6 necesita ICMPv6 (descubrimiento de vecinos); ping IPv4 limitado
+        meta l4proto ipv6-icmp accept
+        ip protocol icmp limit rate 10/second accept
+
+        # DHCP: sin esto, la VPS pierde la red cuando vence su dirección
+        udp sport 67 udp dport 68 accept
+        udp sport 547 udp dport 546 accept
+
+        tcp dport 22 accept
+
+        ip  saddr $CF_V4 tcp dport 443 accept
+        ip6 saddr $CF_V6 tcp dport 443 accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+}
+```
+
+Comprobar la sintaxis (no debe imprimir nada):
+
+```bash
+sudo nft -c -f /etc/nftables.conf
+```
+
+### 3.4 Probar con reversión automática
+
+1. Programar que, en 5 minutos, se borren todas las reglas (red de seguridad):
+   ```bash
+   sudo systemd-run --unit=fw-rollback --on-active=5min /usr/sbin/nft flush ruleset
+   ```
+2. Aplicar las reglas (la sesión actual no se corta: las conexiones ya establecidas siguen permitidas):
+   ```bash
+   sudo nft -f /etc/nftables.conf
+   ```
+3. **Sin cerrar la sesión actual**, abrir una terminal nueva en tu computadora y entrar:
+   ```bash
+   ssh vps
+   ```
+4. Si entra, cancelar la reversión:
+   ```bash
+   sudo systemctl stop fw-rollback.timer
+   ```
+   Si no entra, no hacer nada: a los 5 minutos las reglas se borran solas y el acceso vuelve.
+
+### 3.5 Hacer el firewall permanente
+
+```bash
+sudo systemctl enable --now nftables
+sudo nft list ruleset | head -40
+```
+
+Debe verse la tabla `inet filter` con `policy drop` y las reglas de los puertos 22 y 443.
+
+### 3.6 Actualizar las IPs de Cloudflare cada semana
+
+```bash
+sudo nano /etc/systemd/system/cloudflare-ips.service
+```
+
+```
+[Unit]
+Description=Actualiza rangos IP de Cloudflare para el firewall
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cloudflare-ips
+```
+
+```bash
+sudo nano /etc/systemd/system/cloudflare-ips.timer
+```
+
+```
+[Unit]
+Description=Actualización semanal de IPs de Cloudflare
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Activar, ejecutar una vez a mano y revisar:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now cloudflare-ips.timer
+sudo systemctl start cloudflare-ips.service
+systemctl status cloudflare-ips.service --no-pager
+systemctl list-timers cloudflare-ips.timer
+```
+
+El servicio debe terminar con `status=0/SUCCESS` y el temporizador mostrar una fecha en `NEXT`.
+
+### 3.7 fail2ban
+
+Bloquea temporalmente las IPs que fallan repetidamente al entrar por SSH.
+
+```bash
+sudo apt install -y fail2ban python3-systemd
+sudo nano /etc/fail2ban/jail.local
+```
+
+Contenido:
+
+```
+[DEFAULT]
+# Debian 13 no trae rsyslog (no existe /var/log/auth.log): leer del journal
+backend = systemd
+banaction = nftables-multiport
+banaction_allports = nftables-allports
+
+# 1 hora de bloqueo; cada reincidencia lo duplica, hasta 1 semana
+bantime = 1h
+bantime.increment = true
+bantime.maxtime = 1w
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled = true
+mode = aggressive
+```
+
+No hay jails de nginx a propósito: todo el tráfico web llega a través de Cloudflare, así que banear la IP
+en el origen no corta nada. El filtrado web se hace en el WAF de Cloudflare.
+
+```bash
+sudo systemctl restart fail2ban
+sudo fail2ban-client status sshd
+```
+
+Debe mostrar `Journal matches: _SYSTEMD_UNIT=ssh.service ...`. Es normal que ya aparezca alguna IP en
+`Banned IP list`: fail2ban lee el journal anterior y bloquea a los bots que llevaban días probando SSH.
+Si el bloqueo es de un bot real, ya queda comprobado que el jail funciona.
+
+Probar el bloqueo sin arriesgarse: banear una IP de documentación (no existe en Internet) y quitarla:
+
+```bash
+sudo fail2ban-client set sshd banip 203.0.113.5
+sudo fail2ban-client status sshd
+sudo fail2ban-client set sshd unbanip 203.0.113.5
+```
+
+**No probar fallando contraseñas desde tu propia IP**: te bloquearías a ti mismo.
+
+### 3.8 Verificación desde fuera (en tu computadora)
+
+**Ejecutar en tu computadora, no en la VPS.** El 443 no debe responder a quien no sea Cloudflare (debe
+terminar en timeout):
+
+```bash
+curl -k -m 10 https://IP_DE_LA_VPS
+```
+
+Resultado esperado: `Connection timed out after 10002 milliseconds`. Si el mismo comando se ejecuta **dentro de la
+VPS**, falla al instante con `Could not connect to server`: la conexión sale por la interfaz local, el firewall
+la acepta (`iif lo accept`) y no hay nada escuchando en el 443. No es una fuga, solo es la prueba hecha desde el
+sitio equivocado. Como contraste, un puerto cualquiera (`curl -m 10 http://IP_DE_LA_VPS:8080`) también debe dar timeout.
+
+Y SSH debe seguir funcionando:
+
+```bash
+ssh vps
+```
+
+### 3.9 Prueba de reinicio
+
+Comprobar que el firewall y SSH vuelven solos tras reiniciar (no dejar esta prueba para cuando haya sitios):
+
+```bash
+sudo reboot
+```
+
+Esperar ~1 minuto y entrar con `ssh vps`. Después:
+
+```bash
+sudo nft list ruleset | head -20
+sudo fail2ban-client status sshd
+```
+
+Si no entra tras 3-4 minutos, usar la consola web del proveedor y revisar `sudo systemctl status nftables`.
+
+### Verificación de la Fase 3
+
+- [ ] `sudo nft list ruleset` → tabla `inet filter` con `policy drop` (y sin tablas de UFW).
+- [ ] `cat /etc/nftables.d/cloudflare.nft` → rangos IPv4 e IPv6.
+- [ ] `systemctl list-timers cloudflare-ips.timer` → próxima ejecución programada.
+- [ ] `sudo fail2ban-client status sshd` → jail activo.
+- [ ] `curl -k -m 10 https://IP_DE_LA_VPS` desde fuera → timeout.
+- [ ] `ssh vps` funciona, también después de reiniciar.
 
 ---
 
