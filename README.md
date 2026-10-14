@@ -9,7 +9,7 @@ Cada fase registra qué se hizo, los comandos usados y cómo se verificó.
 | 1. Acceso SSH seguro | Validada |
 | 2. Sistema base | Validada |
 | 3. Firewall y fail2ban | Validada |
-| 4. Stack web | Pendiente |
+| 4. Stack web | Validada |
 | 5. Bases de datos | Pendiente |
 | 6. Estructura por app | Pendiente |
 | 7. Deploy (GitHub Actions) | Pendiente |
@@ -963,6 +963,376 @@ Si no entra tras 3-4 minutos, usar la consola web del proveedor y revisar `sudo 
 - [ ] `sudo fail2ban-client status sshd` → jail activo.
 - [ ] `curl -k -m 10 https://IP_DE_LA_VPS` desde fuera → timeout.
 - [ ] `ssh vps` funciona, también después de reiniciar.
+
+---
+
+## Fase 4 — Stack web
+
+Objetivo: nginx recibiendo solo tráfico de Cloudflare (con el certificado Origin CA y autenticación mutua TLS),
+y los lenguajes instalados: PHP 8.4 con Composer, Node.js LTS y Python 3.13.
+
+Versiones (las de Debian 13 salvo Node): nginx 1.26, PHP 8.4, Composer 2.8, Python 3.13, Node.js 24 LTS (NodeSource).
+
+Valores genéricos de esta sección: `tudominio.com` es tu dominio.
+
+### 4.1 Instalar nginx y quitar el sitio por defecto
+
+```bash
+sudo apt install -y nginx
+sudo rm /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Sin sitios configurados, nginx no debe escuchar en ningún puerto todavía:
+
+```bash
+sudo ss -tlnp | grep nginx
+```
+
+No debe imprimir nada.
+
+### 4.2 Certificados de Cloudflare en el servidor
+
+Tres archivos en `/etc/ssl/cloudflare/`:
+
+| Archivo | Qué es | Permisos |
+|---|---|---|
+| `origin.pem` | Certificado Origin CA (el de 15 años creado en la Fase 0) | 644 |
+| `origin.key` | Su private key | **600**, solo root |
+| `origin-pull-ca.pem` | CA de Cloudflare para validar que quien conecta es Cloudflare (Authenticated Origin Pulls) | 644 |
+
+```bash
+sudo install -d -m 755 /etc/ssl/cloudflare
+sudo nano /etc/ssl/cloudflare/origin.pem
+sudo nano /etc/ssl/cloudflare/origin.key
+```
+
+Pegar en cada archivo el contenido guardado en el gestor de contraseñas (certificado completo con sus líneas
+`BEGIN/END CERTIFICATE`; la key con `BEGIN/END PRIVATE KEY`). **Nunca pegar la private key en chats ni repositorios.**
+
+```bash
+sudo chown root:root /etc/ssl/cloudflare/origin.pem /etc/ssl/cloudflare/origin.key
+sudo chmod 644 /etc/ssl/cloudflare/origin.pem
+sudo chmod 600 /etc/ssl/cloudflare/origin.key
+sudo curl -fsS -o /etc/ssl/cloudflare/origin-pull-ca.pem \
+  https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem
+```
+
+**Problema frecuente:** algunos gestores de contraseñas guardan el certificado y la key **en una sola línea**,
+sin saltos de línea, y OpenSSL no los lee (`Could not find certificate` / `No supported data to decode`).
+Un PEM válido tiene `BEGIN` en su línea, el cuerpo en líneas de 64 caracteres y `END` en su línea.
+Revisar el número de líneas (un certificado ronda las 25; una key, unas 28; **1 línea es el síntoma**):
+
+```bash
+sudo wc -l /etc/ssl/cloudflare/origin.pem /etc/ssl/cloudflare/origin.key
+```
+
+Si están en una línea, reconstruir el formato sin volver a pegar. Certificado:
+
+```bash
+sudo sh -c '{ echo "-----BEGIN CERTIFICATE-----"; tr -d "\n " < /etc/ssl/cloudflare/origin.pem | sed "s/-----BEGINCERTIFICATE-----//;s/-----ENDCERTIFICATE-----//" | fold -w 64; echo; echo "-----END CERTIFICATE-----"; } > /etc/ssl/cloudflare/origin.pem.new && mv /etc/ssl/cloudflare/origin.pem.new /etc/ssl/cloudflare/origin.pem'
+```
+
+Private key. Se crea con `umask 077` (nadie más puede leerla) y solo reemplaza al original si OpenSSL
+la acepta; si falla, el original queda intacto y hay que borrar `origin.key.new`:
+
+```bash
+sudo sh -c 'umask 077; { echo "-----BEGIN PRIVATE KEY-----"; tr -d "\n " < /etc/ssl/cloudflare/origin.key | sed "s/-----BEGINPRIVATEKEY-----//;s/-----ENDPRIVATEKEY-----//" | fold -w 64; echo; echo "-----END PRIVATE KEY-----"; } > /etc/ssl/cloudflare/origin.key.new && openssl pkey -in /etc/ssl/cloudflare/origin.key.new -noout && mv /etc/ssl/cloudflare/origin.key.new /etc/ssl/cloudflare/origin.key'
+```
+
+Comprobar que el certificado cubre tu dominio y que la key le corresponde (debe imprimir `COINCIDEN`):
+
+```bash
+sudo openssl x509 -in /etc/ssl/cloudflare/origin.pem -noout -subject -enddate -ext subjectAltName
+diff <(sudo openssl x509 -in /etc/ssl/cloudflare/origin.pem -noout -pubkey) <(sudo openssl pkey -in /etc/ssl/cloudflare/origin.key -pubout) && echo COINCIDEN
+sudo openssl x509 -in /etc/ssl/cloudflare/origin-pull-ca.pem -noout -subject -enddate
+```
+
+La CA de Authenticated Origin Pulls tiene fecha de vencimiento (en 2029 al escribir esto): antes de esa fecha
+hay que volver a descargarla, o nginx rechazará a Cloudflare. Conviene dejar un recordatorio en el calendario.
+
+### 4.3 Ajustes globales de nginx
+
+Ver qué trae Debian en `nginx.conf` para no duplicar directivas:
+
+```bash
+grep -nE 'ssl_|server_tokens' /etc/nginx/nginx.conf
+```
+
+En Debian 13 ya vienen `server_tokens off`, `ssl_protocols TLSv1.2 TLSv1.3` y `ssl_prefer_server_ciphers off`:
+**no se repiten** en el archivo siguiente (nginx rechaza directivas duplicadas con `directive is duplicate`).
+Si en otra versión `server_tokens` está comentado o `ssl_protocols` incluye TLS 1.0/1.1, corregirlo en `nginx.conf`.
+
+Crear los ajustes globales:
+
+```bash
+sudo nano /etc/nginx/conf.d/00-hardening.conf
+```
+
+```
+# Límites contra clientes lentos o cuerpos enormes
+client_max_body_size 20m;
+client_body_timeout 15s;
+client_header_timeout 15s;
+send_timeout 15s;
+
+ssl_session_cache shared:SSL:10m;
+ssl_session_timeout 1d;
+ssl_session_tickets off;
+
+# Límite de peticiones por IP real del visitante (segunda capa tras Cloudflare).
+# Cada sitio lo activa con: limit_req zone=perip burst=40 nodelay;
+limit_req_zone $binary_remote_addr zone=perip:10m rate=20r/s;
+limit_req_status 429;
+
+# WebSockets para apps Node/Python
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+```
+
+```bash
+sudo nginx -t
+```
+
+### 4.4 Fragmentos reutilizables y sitio por defecto
+
+Los fragmentos (`snippets`) evitan repetir lo mismo en cada sitio.
+
+```bash
+sudo nano /etc/nginx/snippets/cloudflare-origin.conf
+```
+
+```
+# Certificado Origin CA + exigir que quien conecta sea Cloudflare (mTLS)
+ssl_certificate         /etc/ssl/cloudflare/origin.pem;
+ssl_certificate_key     /etc/ssl/cloudflare/origin.key;
+ssl_client_certificate  /etc/ssl/cloudflare/origin-pull-ca.pem;
+ssl_verify_client on;
+```
+
+```bash
+sudo nano /etc/nginx/snippets/security-headers.conf
+```
+
+```
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header X-Frame-Options "SAMEORIGIN" always;
+```
+
+HSTS no va aquí: se activa en Cloudflare en la Fase 9.
+
+Sitio por defecto: rechaza el handshake TLS de cualquier dominio no configurado (escaneos por IP, dominios ajenos
+apuntando a tu servidor):
+
+```bash
+sudo nano /etc/nginx/sites-available/00-default.conf
+```
+
+```
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    ssl_reject_handshake on;
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/00-default.conf /etc/nginx/sites-enabled/00-default.conf
+sudo nginx -t
+```
+
+### 4.5 IP real del visitante
+
+Detrás de Cloudflare, nginx ve la IP de Cloudflare. La IP real viene en la cabecera `CF-Connecting-IP`, y solo
+se puede confiar en ella si la petición viene de un rango de Cloudflare. Se amplía el script de la Fase 3 para
+generar esa configuración y mantenerla al día.
+
+```bash
+sudo nano /usr/local/sbin/cloudflare-ips
+```
+
+Agregar **al final** del archivo:
+
+```bash
+
+# nginx: confiar en CF-Connecting-IP solo si la petición viene de un rango de Cloudflare
+if [ -d /etc/nginx/conf.d ]; then
+  {
+    echo "# Generado por /usr/local/sbin/cloudflare-ips, no editar a mano"
+    printf '%s\n' "$v4" "$v6" | sed 's/.*/set_real_ip_from &;/'
+    echo "real_ip_header CF-Connecting-IP;"
+  } > /etc/nginx/conf.d/cloudflare-realip.conf
+  if nginx -t 2>/dev/null; then
+    systemctl reload nginx
+  else
+    echo "nginx: configuración inválida, no se recargó" >&2
+  fi
+fi
+```
+
+Ejecutarlo y comprobar:
+
+```bash
+sudo /usr/local/sbin/cloudflare-ips
+head -3 /etc/nginx/conf.d/cloudflare-realip.conf
+sudo nginx -t
+```
+
+### 4.6 Sitio de prueba
+
+Un sitio mínimo para comprobar todo el camino Cloudflare → nginx. Se elimina en la Fase 6, cuando haya sitios reales.
+
+```bash
+sudo mkdir -p /var/www/test
+echo 'ok' | sudo tee /var/www/test/index.html
+sudo nano /etc/nginx/sites-available/test.conf
+```
+
+```
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name tudominio.com www.tudominio.com;
+
+    include snippets/cloudflare-origin.conf;
+    include snippets/security-headers.conf;
+    limit_req zone=perip burst=40 nodelay;
+
+    root /var/www/test;
+    index index.html;
+
+    location / { try_files $uri $uri/ =404; }
+    location ~ /\. { deny all; }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/test.conf /etc/nginx/sites-enabled/test.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+**Desde tu computadora**, la petición pasa por Cloudflare:
+
+```bash
+curl -I https://tudominio.com
+```
+
+Debe responder `HTTP/2 200` con `server: cloudflare`.
+
+**En la VPS**, comprobar que sin ser Cloudflare no se puede hablar con nginx (sin certificado de cliente):
+
+```bash
+curl -sk --resolve tudominio.com:443:127.0.0.1 https://tudominio.com -o /dev/null -w '%{http_code}\n'
+```
+
+Debe imprimir `400` (nginx rechaza: "No required SSL certificate was sent"). Y un dominio no configurado no completa el handshake:
+
+```bash
+curl -sk --resolve otro.invalid:443:127.0.0.1 https://otro.invalid -o /dev/null -w '%{http_code}\n'
+```
+
+Debe imprimir `000` (handshake rechazado).
+
+La IP real del visitante debe aparecer en el log, no la de Cloudflare:
+
+```bash
+sudo tail -n 3 /var/log/nginx/access.log
+```
+
+### 4.7 PHP y Composer
+
+```bash
+sudo apt install -y php-fpm php-cli php-mbstring php-xml php-curl php-zip php-bcmath php-intl php-gd \
+  php-pgsql php-mysql php-sqlite3 php8.4-opcache composer
+```
+
+Endurecer PHP-FPM:
+
+```bash
+sudo nano /etc/php/8.4/fpm/conf.d/99-hardening.ini
+```
+
+```
+expose_php = Off
+display_errors = Off
+log_errors = On
+cgi.fix_pathinfo = 0
+
+memory_limit = 256M
+max_execution_time = 60
+upload_max_filesize = 20M
+post_max_size = 20M
+
+session.cookie_httponly = 1
+session.cookie_secure = 1
+session.use_strict_mode = 1
+
+opcache.enable = 1
+opcache.memory_consumption = 96
+opcache.max_accelerated_files = 20000
+; El deploy recarga php-fpm, así que PHP no revisa si los archivos cambiaron en cada petición.
+; Si se edita código a mano en el servidor: sudo systemctl reload php8.4-fpm
+opcache.validate_timestamps = 0
+```
+
+```bash
+sudo php-fpm8.4 -t
+sudo systemctl reload php8.4-fpm
+php -v
+composer --version
+php -m | grep -E 'pdo_pgsql|pdo_mysql|mbstring|intl|gd|zip|bcmath|Zend OPcache'
+```
+
+El pool `www` que trae Debian se reemplaza por un pool por aplicación en la Fase 6.
+
+### 4.8 Node.js LTS
+
+Se usa el repositorio oficial de NodeSource (el Node de Debian es una versión vieja). La clave se descarga y
+se verifica con `signed-by`, sin ejecutar scripts remotos como root. En el servidor solo se **ejecuta** Node:
+las apps se compilan en GitHub Actions (Fase 7), por eso no se instala pnpm ni yarn aquí.
+
+```bash
+sudo install -d -m 755 /etc/apt/keyrings
+curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list
+sudo apt update
+apt-cache policy nodejs | head -4
+```
+
+`Candidate` debe ser `24.x` y venir de `deb.nodesource.com`. Instalar:
+
+```bash
+sudo apt install -y nodejs
+node -v
+npm -v
+```
+
+### 4.9 Python
+
+```bash
+sudo apt install -y python3-venv python3-pip
+python3 -V
+python3 -m venv /tmp/prueba-venv && /tmp/prueba-venv/bin/pip -V && rm -rf /tmp/prueba-venv
+```
+
+Debian impide instalar paquetes con `pip` fuera de un entorno virtual (PEP 668): cada app usa su propio `venv`.
+No se instalan compiladores (`build-essential`): si un paquete Python necesita compilar, se prefiere su versión
+binaria (por ejemplo `psycopg2-binary`) y solo si hace falta se instalan temporalmente.
+
+### Verificación de la Fase 4
+
+- [ ] `curl -I https://tudominio.com` desde tu computadora → `HTTP/2 200`.
+- [ ] En la VPS, sin certificado de cliente → `400`; dominio desconocido → `000`.
+- [ ] `sudo tail -n 3 /var/log/nginx/access.log` → tu IP real, no la de Cloudflare.
+- [ ] `sudo ss -tlnp` → hacia afuera solo 22 y 443 (nginx en 443; PHP-FPM por socket).
+- [ ] `php -v` → 8.4, `composer --version`, `node -v` → v24, `python3 -V` → 3.13.
+- [ ] `sudo nginx -t` y `sudo php-fpm8.4 -t` sin errores.
 
 ---
 
