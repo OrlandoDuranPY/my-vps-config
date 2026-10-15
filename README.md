@@ -10,7 +10,7 @@ Cada fase registra qué se hizo, los comandos usados y cómo se verificó.
 | 2. Sistema base | Validada |
 | 3. Firewall y fail2ban | Validada |
 | 4. Stack web | Validada |
-| 5. Bases de datos | Pendiente |
+| 5. Bases de datos | Validada |
 | 6. Estructura por app | Pendiente |
 | 7. Deploy (GitHub Actions) | Pendiente |
 | 8. Backups | Pendiente |
@@ -1333,6 +1333,210 @@ binaria (por ejemplo `psycopg2-binary`) y solo si hace falta se instalan tempora
 - [ ] `sudo ss -tlnp` → hacia afuera solo 22 y 443 (nginx en 443; PHP-FPM por socket).
 - [ ] `php -v` → 8.4, `composer --version`, `node -v` → v24, `python3 -V` → 3.13.
 - [ ] `sudo nginx -t` y `sudo php-fpm8.4 -t` sin errores.
+
+---
+
+## Fase 5 — Bases de datos
+
+Objetivo: PostgreSQL y MariaDB instalados, accesibles **solo desde el propio servidor**, ajustados a la RAM
+disponible, con un usuario y una base de datos por aplicación.
+
+Versiones de Debian 13: PostgreSQL 17 y MariaDB 11.8. Debian no incluye el MySQL de Oracle: MariaDB es
+compatible con MySQL y Laravel la soporta. Si algún proyecto exige MySQL de Oracle específicamente, se evalúa
+su repositorio oficial por separado.
+
+Reglas de esta fase:
+- Las bases de datos **nunca** se exponen a Internet: ni 5432 ni 3306 se abren en el firewall.
+- **Un usuario y una base de datos por app**, con contraseña aleatoria y permisos solo sobre su base.
+  Las apps jamás usan `postgres` ni `root`.
+- Las contraseñas no se escriben en la línea de comandos (quedarían en el historial del shell): se teclean
+  cuando el programa las pide.
+
+Valores genéricos: `APP` es el nombre de la aplicación (se usa como usuario y como base de datos).
+
+### 5.1 Instalar los motores
+
+```bash
+sudo apt install -y postgresql mariadb-server
+```
+
+Comprobar que ambos están activos:
+
+```bash
+systemctl is-active postgresql mariadb
+```
+
+Debe imprimir `active` dos veces.
+
+### 5.2 Comprobar que solo escuchan en local
+
+```bash
+sudo ss -tlnp | grep -E '5432|3306'
+```
+
+PostgreSQL debe aparecer en `127.0.0.1:5432` (y `[::1]:5432`) y MariaDB en `127.0.0.1:3306`. Ninguno en `0.0.0.0`.
+
+Revisar cómo autentica PostgreSQL (líneas activas de `pg_hba.conf`):
+
+```bash
+sudo grep -vE '^\s*(#|$)' /etc/postgresql/17/main/pg_hba.conf
+```
+
+Esperado: `local ... peer` (solo usuarios del sistema), y `host ... 127.0.0.1/32` y `::1/128` con `scram-sha-256`.
+Ninguna línea con `trust` ni con `0.0.0.0/0`.
+
+### 5.3 Ajustar PostgreSQL a 2 GB de RAM
+
+Debian lee todo lo que haya en `conf.d` sin tocar el archivo principal.
+
+```bash
+sudo nano /etc/postgresql/17/main/conf.d/tuning.conf
+```
+
+```
+# Ajustado para ~2 GB de RAM compartidos con MariaDB, PHP y Node
+listen_addresses = 'localhost'
+max_connections = 50
+shared_buffers = 256MB
+effective_cache_size = 768MB
+work_mem = 4MB
+maintenance_work_mem = 64MB
+log_min_duration_statement = 1000
+```
+
+`log_min_duration_statement` registra las consultas que tardan más de 1 segundo, útil para detectar lentitud.
+`shared_buffers` requiere reiniciar:
+
+```bash
+sudo systemctl restart postgresql
+sudo -u postgres psql -c 'SHOW shared_buffers;' -c 'SHOW max_connections;'
+```
+
+Debe mostrar `256MB` y `50`.
+
+### 5.4 Ajustar y revisar MariaDB
+
+```bash
+sudo nano /etc/mysql/mariadb.conf.d/60-local.cnf
+```
+
+```
+# Ajustado para ~2 GB de RAM compartidos con PostgreSQL, PHP y Node
+[mysqld]
+bind-address = 127.0.0.1
+skip-name-resolve
+local-infile = 0
+max_connections = 50
+innodb_buffer_pool_size = 256M
+performance_schema = OFF
+```
+
+```bash
+sudo systemctl restart mariadb
+sudo mariadb -e "SELECT @@innodb_buffer_pool_size/1024/1024 AS buffer_pool_mb, @@bind_address;"
+```
+
+Debe mostrar `256` y `127.0.0.1`.
+
+`root` de MariaDB entra por el socket del sistema (`sudo mariadb`), sin contraseña ni acceso remoto. Revisar que no
+haya usuarios anónimos ni base de datos de prueba:
+
+```bash
+sudo mariadb -e "SELECT user, host FROM mysql.user; SHOW DATABASES;"
+```
+
+Si aparece un usuario con nombre vacío (`''`) o una base `test`, eliminarlos:
+
+```bash
+sudo mariadb -e "DROP USER IF EXISTS ''@'localhost'; DROP DATABASE IF EXISTS test;"
+```
+
+### 5.5 Crear un usuario y una base por aplicación
+
+**PostgreSQL.** `--pwprompt` pide la contraseña sin dejarla en el historial. Usar una contraseña aleatoria
+generada con el gestor de contraseñas (mejor sin caracteres que compliquen archivos `.env`, como `#` o `'`):
+
+```bash
+sudo -u postgres createuser --pwprompt APP
+sudo -u postgres createdb -O APP APP
+sudo -u postgres psql -c 'REVOKE CONNECT ON DATABASE "APP" FROM PUBLIC;'
+```
+
+El `REVOKE` impide que los usuarios de otras apps se conecten a esta base (por defecto cualquiera puede).
+
+**MariaDB.** `MYSQL_HISTFILE=/dev/null` evita que la contraseña quede guardada en `~/.mysql_history`:
+
+```bash
+sudo MYSQL_HISTFILE=/dev/null mariadb
+```
+
+Dentro del cliente (sustituir `APP` y la contraseña):
+
+```sql
+CREATE DATABASE APP CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'APP'@'127.0.0.1' IDENTIFIED BY 'CONTRASEÑA_ALEATORIA';
+GRANT ALL PRIVILEGES ON APP.* TO 'APP'@'127.0.0.1';
+EXIT;
+```
+
+El usuario se crea para `127.0.0.1` porque, con `skip-name-resolve`, la app debe conectar por TCP a
+`127.0.0.1` (en Laravel: `DB_HOST=127.0.0.1`), no a `localhost`.
+
+**Prueba de punta a punta** (con una base temporal `demo`; repetir los comandos anteriores con `demo` en vez de `APP`):
+
+```bash
+psql -h 127.0.0.1 -U demo demo -c '\conninfo'
+mariadb -h 127.0.0.1 -u demo -p demo -e 'SELECT CURRENT_USER();'
+```
+
+Ambos piden la contraseña de `demo` y deben conectar. Después, eliminar lo temporal:
+
+```bash
+sudo -u postgres dropdb demo
+sudo -u postgres dropuser demo
+sudo mariadb -e "DROP DATABASE demo; DROP USER 'demo'@'127.0.0.1';"
+```
+
+Comprobar que no quedó nada (en PostgreSQL solo deben salir `postgres` y roles internos `pg_...`; en MariaDB solo
+`mariadb.sys`, `mysql`, `root`). Ojo: dentro de comillas dobles, bash interpreta `!` como historial; evitarlo en estas consultas.
+
+```bash
+sudo -u postgres psql -At -c "SELECT rolname FROM pg_roles ORDER BY 1;"
+sudo mariadb -e "SELECT user, host FROM mysql.user; SHOW DATABASES;"
+```
+
+### 5.6 Conectar desde tu computadora (túnel SSH)
+
+Los puertos no están abiertos, así que los clientes gráficos (DBeaver, TablePlus, DataGrip) entran por un túnel
+SSH. El `sshd` de la Fase 1 lo permite (`AllowTcpForwarding local`).
+
+```bash
+ssh -N -L 15432:127.0.0.1:5432 -L 13306:127.0.0.1:3306 vps
+```
+
+Comprobar que el túnel funciona (desde otra terminal de tu computadora, con el túnel abierto):
+
+```bash
+timeout 3 bash -c '</dev/tcp/127.0.0.1/15432' && echo ABIERTO
+```
+
+Debe imprimir `ABIERTO`. Con el túnel cerrado, no imprime nada.
+
+Con el túnel abierto, el cliente se conecta a `127.0.0.1` puerto `15432` (PostgreSQL) o `13306` (MariaDB), con el
+usuario y contraseña de la app. Para cerrarlo, `Ctrl+C`.
+
+Alternativa sin túnel manual: la mayoría de clientes tienen la opción "SSH tunnel" en la conexión; se rellena con
+host de la VPS, tu usuario administrador y tu llave.
+
+### Verificación de la Fase 5
+
+- [ ] `systemctl is-active postgresql mariadb` → `active` ×2.
+- [ ] `sudo ss -tlnp | grep -E '5432|3306'` → solo en `127.0.0.1` / `::1`.
+- [ ] `pg_hba.conf` sin `trust` ni `0.0.0.0/0`.
+- [ ] `SHOW shared_buffers` → 256MB; `innodb_buffer_pool_size` → 256 MB.
+- [ ] Sin usuarios anónimos ni base `test` en MariaDB.
+- [ ] La prueba con `demo` conecta en ambos motores y queda eliminada.
+- [ ] `free -h` muestra memoria disponible razonable con todo en marcha.
 
 ---
 
