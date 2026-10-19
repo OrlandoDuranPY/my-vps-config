@@ -12,7 +12,7 @@ Cada fase registra qué se hizo, los comandos usados y cómo se verificó.
 | 4. Stack web | Validada |
 | 5. Bases de datos | Validada |
 | 6. Estructura por app | Validada |
-| 7. Deploy (GitHub Actions) | Pendiente |
+| 7. Deploy (GitHub Actions) | Validada |
 | 8. Backups | Pendiente |
 | 9. Verificación final | Pendiente |
 
@@ -1927,7 +1927,332 @@ Debe responder `Permission denied`.
 
 ---
 
+## Fase 7 — Deploy con GitHub Actions
+
+Objetivo: cada push a `main` compila el proyecto **en GitHub** y sube solo el resultado a la VPS, sin caída y con
+rollback inmediato.
+
+Por qué no se clona ni se compila en la VPS:
+- **RAM:** compilar Next/Nuxt suele pasar de 1.5–2 GB; en una VPS de 2 GB tumbaría la base de datos o el sitio.
+- **Seguridad:** la VPS no necesita acceso al repo (si la comprometen no se llevan código ni historial), no hay
+  `.git` en el servidor y no se instalan cientos de paquetes de desarrollo (con scripts que se ejecutan al instalarse).
+- **Sin caídas:** la versión nueva se prepara en `releases/<nueva>` y el cambio de `current` es instantáneo.
+- **Fallos seguros:** si el build falla en GitHub, el servidor no se toca. Si la versión desplegada sale mal,
+  volver atrás es cambiar un symlink.
+
+Flujo de cada deploy:
+
+```
+push a main ─► GitHub Actions: composer install --no-dev + npm run build
+            ─► rsync por SSH a releases/<fecha>-<commit>/   (un usuario y una llave por componente)
+            ─► enlazar shared/ (.env, storage, uploads) ─► migraciones ─► caché de Laravel
+            ─► current -> releases/<nueva>  ─► recargar PHP-FPM / reiniciar Node ─► comprobar ─► borrar versiones viejas (se guardan 5)
+```
+
+Nombres genéricos: los de la Fase 6 (`miapp-api`, `miapp-web`, `tudominio.com`). El ejemplo es un monorepo
+Laravel (`backend/`) + Next (`frontend/`); al final hay variantes para otros tipos de proyecto.
+
+### 7.1 Next en modo standalone (en tu repo)
+
+En `frontend/next.config.ts`, dentro de `nextConfig`:
+
+```ts
+output: "standalone",
+```
+
+Compilar en local y comprobar que se genera el servidor mínimo:
+
+```bash
+cd frontend && npm run build && ls .next/standalone/server.js
+```
+
+### 7.2 Llaves de deploy (en tu computadora)
+
+Una llave **por componente**, sin passphrase (GitHub Actions no puede escribirla). Se generan en una carpeta temporal:
+la privada va a GitHub y luego se borra; la pública va al servidor.
+
+```bash
+mkdir -p ~/deploy-keys && cd ~/deploy-keys
+ssh-keygen -t ed25519 -N '' -f miapp-api -C 'github-actions@miapp-api'
+ssh-keygen -t ed25519 -N '' -f miapp-web -C 'github-actions@miapp-web'
+```
+
+Huella del servidor para fijarla en GitHub (evita ataques de intermediario). Comprobar que la huella ED25519
+coincide con la verificada en la Fase 0:
+
+```bash
+ssh-keyscan -t ed25519 IP_DE_LA_VPS > known_hosts
+ssh-keygen -lf known_hosts
+```
+
+### 7.3 Permitir el SSH de deploy (en la VPS)
+
+Los usuarios de los componentes entran al grupo `sshusers` (Fase 1) y reciben su llave pública con `restrict`
+(sin terminal interactiva, sin túneles ni reenvío de agente: solo ejecutar comandos y rsync).
+
+```bash
+sudo usermod -aG sshusers miapp-api
+sudo usermod -aG sshusers miapp-web
+sudo install -d -m 700 -o miapp-api -g miapp-api /var/www/miapp-api/.ssh
+sudo install -d -m 700 -o miapp-web -g miapp-web /var/www/miapp-web/.ssh
+```
+
+Crear `authorized_keys` de cada uno con **una línea**: `restrict ` seguido del contenido de su `.pub`:
+
+```bash
+sudo -u miapp-api nano /var/www/miapp-api/.ssh/authorized_keys
+sudo -u miapp-web nano /var/www/miapp-web/.ssh/authorized_keys
+sudo chmod 600 /var/www/miapp-api/.ssh/authorized_keys /var/www/miapp-web/.ssh/authorized_keys
+```
+
+Ejemplo de línea: `restrict ssh-ed25519 AAAA... github-actions@miapp-api`.
+
+### 7.4 Permisos exactos de sudo (en la VPS)
+
+Cada componente solo puede ejecutar **un** comando con sudo, sin contraseña. Nada más.
+
+```bash
+sudo visudo -f /etc/sudoers.d/miapp-deploy
+```
+
+```
+# Deploy de miapp: solo recargar/reiniciar su servicio
+miapp-api ALL=(root) NOPASSWD: /usr/bin/systemctl reload php8.4-fpm
+miapp-web ALL=(root) NOPASSWD: /usr/bin/systemctl restart miapp-web
+```
+
+`visudo` valida la sintaxis al guardar (un error en sudoers puede romper `sudo`). Comprobar:
+
+```bash
+sudo -u miapp-api sudo -n /usr/bin/systemctl reload php8.4-fpm && echo PERMITIDO
+sudo -u miapp-api sudo -n /usr/bin/systemctl restart nginx
+```
+
+El primero debe imprimir `PERMITIDO`; el segundo, `a password is required` (denegado).
+
+**Prueba de la llave** (en tu computadora): debe ejecutar el comando y salir, sin terminal interactiva:
+
+```bash
+ssh -i ~/deploy-keys/miapp-api miapp-api@IP_DE_LA_VPS 'whoami'
+```
+
+### 7.5 Secretos y variables en GitHub
+
+En el repo: `Settings → Secrets and variables → Actions`.
+
+| Tipo | Nombre | Valor |
+|---|---|---|
+| Secret | `VPS_HOST` | IP de la VPS (como secreto: así no aparece en los logs, aunque el repo sea público) |
+| Secret | `VPS_KNOWN_HOSTS` | contenido del archivo `known_hosts` del paso 7.2 |
+| Secret | `DEPLOY_KEY_API` | contenido de la llave **privada** `miapp-api` (sin `.pub`) |
+| Secret | `DEPLOY_KEY_WEB` | contenido de la llave **privada** `miapp-web` |
+| Variable | `SITE_URL` | `https://www.tudominio.com` |
+
+Después, borrar las llaves privadas de tu computadora (GitHub ya las tiene; si se pierden, se generan otras):
+
+```bash
+rm -r ~/deploy-keys
+```
+
+### 7.6 Workflow (en tu repo)
+
+Archivo `.github/workflows/deploy.yml`:
+
+```yaml
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Un deploy a la vez; si hay otro en curso, el nuevo espera
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Nombre de la versión
+        run: echo "RELEASE=$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      # ---------- Backend: Laravel ----------
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, intl, bcmath, gd, zip, pdo_pgsql
+          tools: composer:v2
+          coverage: none
+
+      - name: Composer (solo dependencias de producción)
+        working-directory: backend
+        run: composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
+
+      # ---------- Frontend: Next standalone ----------
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build de Next
+        working-directory: frontend
+        env:
+          API_URL: http://127.0.0.1:8000
+          NEXT_PUBLIC_SITE_URL: ${{ vars.SITE_URL }}
+        run: |
+          npm ci
+          npm run build
+          cp -r .next/static .next/standalone/.next/static
+          cp -r public .next/standalone/public
+
+      # ---------- SSH ----------
+      - name: Configurar SSH
+        env:
+          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          KEY_API: ${{ secrets.DEPLOY_KEY_API }}
+          KEY_WEB: ${{ secrets.DEPLOY_KEY_WEB }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf '%s\n' "$KEY_API" > ~/.ssh/api
+          printf '%s\n' "$KEY_WEB" > ~/.ssh/web
+          chmod 600 ~/.ssh/api ~/.ssh/web
+
+      # ---------- Desplegar backend ----------
+      - name: Subir backend
+        env:
+          HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          rsync -az \
+            --exclude='.env' --exclude='/storage' --exclude='/public/uploads' \
+            --exclude='/tests' --exclude='.git*' \
+            -e 'ssh -i ~/.ssh/api' \
+            backend/ "miapp-api@$HOST:/var/www/miapp-api/releases/$RELEASE/"
+
+      - name: Activar backend
+        env:
+          HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          ssh -i ~/.ssh/api "miapp-api@$HOST" "RELEASE=$RELEASE bash -s" <<'EOF'
+          set -euo pipefail
+          cd /var/www/miapp-api
+          R="releases/$RELEASE"
+          # Lo que sobrevive entre deploys vive en shared/
+          ln -s ../../shared/.env "$R/.env"
+          ln -s ../../shared/storage "$R/storage"
+          install -d -m 750 shared/uploads
+          ln -s ../../../shared/uploads "$R/public/uploads"
+          php "$R/artisan" migrate --force
+          # Laravel con vistas (Blade/Inertia): basta con `php "$R/artisan" optimize`
+          php "$R/artisan" config:cache && php "$R/artisan" event:cache && php "$R/artisan" route:cache
+          # Cambio atómico de versión
+          ln -sfn "$R" current.tmp && mv -Tf current.tmp current
+          sudo /usr/bin/systemctl reload php8.4-fpm
+          # Conservar las 5 versiones más recientes
+          ls -1dt releases/*/ | tail -n +6 | xargs -r rm -rf
+          EOF
+
+      # ---------- Desplegar frontend ----------
+      - name: Subir frontend
+        env:
+          HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          rsync -az -e 'ssh -i ~/.ssh/web' \
+            frontend/.next/standalone/ "miapp-web@$HOST:/var/www/miapp-web/releases/$RELEASE/"
+
+      - name: Activar frontend
+        env:
+          HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          ssh -i ~/.ssh/web "miapp-web@$HOST" "RELEASE=$RELEASE bash -s" <<'EOF'
+          set -euo pipefail
+          cd /var/www/miapp-web
+          ln -sfn "releases/$RELEASE" current.tmp && mv -Tf current.tmp current
+          sudo /usr/bin/systemctl restart miapp-web
+          # Esperar a que Next responda (hasta ~30 s); si no, el workflow falla
+          for i in $(seq 1 15); do curl -fsS -o /dev/null http://127.0.0.1:3000/ && break; sleep 2; done
+          curl -fsS -o /dev/null http://127.0.0.1:3000/
+          ls -1dt releases/*/ | tail -n +6 | xargs -r rm -rf
+          EOF
+```
+
+Notas:
+- `API_URL` se fija **al compilar**: debe ser la dirección interna de Laravel en la VPS.
+- Los archivos subidos (`public/uploads`) viven en `shared/uploads`: si no, cada deploy los borraría.
+- Al reiniciar Node hay unos segundos sin servicio (Cloudflare muestra un error breve). Aceptable para un sitio personal.
+
+### 7.7 Primer deploy
+
+1. Commit y push de `next.config.ts` y del workflow a `main`.
+2. Seguir la ejecución en `Actions` del repo. Si un paso falla, el log dice cuál; el servidor queda en la versión anterior
+   (si falló antes de "Activar").
+3. Al terminar, crear el usuario administrador de la app (solo la primera vez; el comando muestra la contraseña una vez):
+
+   ```bash
+   sudo -u miapp-api php /var/www/miapp-api/current/artisan admin:password tu@correo
+   ```
+
+4. Borrar las versiones de prueba de la Fase 6:
+
+   ```bash
+   sudo rm -r /var/www/miapp-api/releases/prueba /var/www/miapp-web/releases/prueba
+   ```
+
+5. Comprobar el sitio desde el navegador, el login del dashboard y la subida de una imagen.
+
+### 7.8 Rollback (volver a la versión anterior)
+
+Listar versiones (la primera es la activa) y apuntar `current` a la anterior:
+
+```bash
+sudo ls -1t /var/www/miapp-web/releases/
+sudo -u miapp-web ln -sfn releases/VERSION_ANTERIOR /var/www/miapp-web/current
+sudo systemctl restart miapp-web
+```
+
+Para Laravel es igual, con `systemctl reload php8.4-fpm`. Si la versión nueva traía migraciones, revisarlas antes:
+volver el código atrás no deshace los cambios en la base de datos.
+
+### 7.9 Otras combinaciones
+
+| Proyecto | Qué cambia en el workflow |
+|---|---|
+| Solo Laravel | Solo la parte de backend. Si usa Vite (Vue/React/Inertia): `npm ci && npm run build` en la carpeta de Laravel antes del rsync, y excluir `node_modules` del rsync |
+| SPA estática + API Laravel | La parte de backend + subir `dist/` (o `build/`) a `releases/` del componente estático y cambiar `current`; sin reinicio |
+| Solo Next/Nuxt | Solo la parte de frontend (Nuxt: subir `.output/` y `ExecStart=/usr/bin/node .output/server/index.mjs`) |
+
+### Verificación de la Fase 7
+
+- [x] Las llaves de deploy solo ejecutan comandos (`ssh ... 'whoami'` responde y sale).
+- [x] sudo de los componentes permite solo su comando.
+- [x] Un push a `main` termina en verde en `Actions`.
+- [x] `sudo ls -l /var/www/miapp-*/current` apunta a la versión nueva.
+- [x] El sitio carga, el login funciona y una imagen subida **sobrevive** a un segundo deploy.
+- [x] Sin llaves privadas de deploy en tu computadora.
+
+---
+
 ## Problemas comunes
+
+### Login responde 200 pero vuelve al login (Next + Sanctum)
+
+En el log de nginx, `/api/user` da 401 con Referer `https://localhost:3000/`. En standalone,
+`request.nextUrl.origin` del middleware/proxy de Next es el host interno, no el dominio. Si el código
+manda ese origen como `Referer` a Sanctum, no está en `SANCTUM_STATEFUL_DOMAINS` y no hay sesión.
+Solución: usar la URL pública (`NEXT_PUBLIC_SITE_URL`) como `Referer`.
+
+### `The ".../resources/views" directory does not exist` en el deploy
+
+Laravel solo API (sin vistas): `artisan optimize` falla al cachear vistas. Usar
+`config:cache`, `event:cache` y `route:cache` por separado (ya está así en 7.6).
 
 ### `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!`
 
