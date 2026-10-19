@@ -11,7 +11,7 @@ Cada fase registra qué se hizo, los comandos usados y cómo se verificó.
 | 3. Firewall y fail2ban | Validada |
 | 4. Stack web | Validada |
 | 5. Bases de datos | Validada |
-| 6. Estructura por app | Pendiente |
+| 6. Estructura por app | Validada |
 | 7. Deploy (GitHub Actions) | Pendiente |
 | 8. Backups | Pendiente |
 | 9. Verificación final | Pendiente |
@@ -1537,6 +1537,393 @@ host de la VPS, tu usuario administrador y tu llave.
 - [ ] Sin usuarios anónimos ni base `test` en MariaDB.
 - [ ] La prueba con `demo` conecta en ambos motores y queda eliminada.
 - [ ] `free -h` muestra memoria disponible razonable con todo en marcha.
+
+---
+
+## Fase 6 — Estructura por aplicación
+
+Objetivo: cada aplicación queda aislada en su propio usuario de Linux, con una estructura de carpetas que permite
+deploys sin caída y rollback inmediato.
+
+### 6.1 Modelo: proyectos y componentes
+
+Un **proyecto** (un repo) se compone de uno o más **componentes**: cada parte que corre por separado.
+Cada componente tiene **su propio usuario de Linux**, su carpeta en `/var/www/` y su configuración. Si un
+componente es comprometido, no puede leer los secretos de los demás.
+
+| Tipo de componente | Cómo corre | Expuesto por nginx |
+|---|---|---|
+| **Laravel** | pool PHP-FPM propio (socket) | público (443) o interno (`127.0.0.1:PUERTO`) |
+| **Node SSR** (Next, Nuxt) | servicio systemd en `127.0.0.1:PUERTO` | proxy desde el 443 |
+| **Estático** (SPA Vue/React compilada) | solo archivos, sin proceso | nginx los sirve directo |
+| **Python** (FastAPI, Django) | servicio systemd (gunicorn/uvicorn) en `127.0.0.1:PUERTO` | proxy desde el 443 |
+
+Combinaciones habituales:
+
+| Proyecto | Componentes |
+|---|---|
+| Solo Laravel, o Laravel + Vue/React dentro de Laravel (Inertia, Vite) | 1 Laravel **público**. Los assets de Vite se compilan en el deploy y viven en `public/build` |
+| API Laravel + SPA separada (Vue/React) | 1 Laravel + 1 estático. Mismo dominio (`/api` a PHP, resto a la SPA) o subdominio para la API |
+| Monorepo Laravel + Next/Nuxt (el navegador solo habla con Node) | 1 Laravel **interno** + 1 Node SSR **público** |
+| Solo Next/Nuxt | 1 Node SSR público |
+
+Estructura de cada componente (las mismas carpetas para todos):
+
+```
+/var/www/COMPONENTE/
+├── releases/        # una carpeta por deploy (releases/20261020-153000)
+├── shared/          # lo que sobrevive entre deploys: .env, storage/, archivos subidos
+└── current -> releases/<la activa>   # symlink: cambiarlo es el deploy (atómico)
+```
+
+Nombres genéricos de esta fase: proyecto `miapp`, componentes `miapp-api` (Laravel) y `miapp-web` (Node).
+Cada componente interno necesita **un puerto propio**: llevar una lista, por ejemplo:
+
+| Puerto | Componente |
+|---|---|
+| 3000 | miapp-web (Next) |
+| 8000 | miapp-api (Laravel interno) |
+
+> El usuario del componente es también el que recibe los deploys (Fase 7), así que puede escribir su código.
+> Es un compromiso aceptado para mantenerlo simple: el aislamiento importante es **entre componentes**.
+
+### 6.2 Limpiar lo temporal de la Fase 4
+
+```bash
+sudo rm /etc/nginx/sites-enabled/test.conf /etc/nginx/sites-available/test.conf
+sudo rm -r /var/www/test
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### 6.3 Crear el usuario y las carpetas de un componente
+
+Se repite **por cada componente** (aquí con `miapp-api`; luego con `miapp-web`). Usuario de sistema, sin
+contraseña y sin sudo:
+
+```bash
+sudo adduser --system --group --home /var/www/miapp-api --shell /bin/bash miapp-api
+sudo install -d -m 750 -o miapp-api -g miapp-api /var/www/miapp-api/releases /var/www/miapp-api/shared
+sudo chmod 750 /var/www/miapp-api
+sudo ls -la /var/www/miapp-api
+```
+
+**Solo para componentes Laravel y estáticos** (nginx debe leer `public/`): dar a nginx acceso de lectura
+entrando en el grupo del componente, y reiniciarlo para que tome el grupo nuevo:
+
+```bash
+sudo usermod -aG miapp-api www-data
+sudo systemctl restart nginx
+```
+
+Los componentes Node y Python **no** necesitan esto: nginx solo les reenvía peticiones.
+
+### 6.4 Componente Laravel: carpetas compartidas y `.env`
+
+Lo que debe sobrevivir entre deploys: `storage/` (logs, sesiones, archivos subidos) y `.env`.
+
+```bash
+sudo install -d -m 750 -o miapp-api -g miapp-api \
+  /var/www/miapp-api/shared/storage/app/public \
+  /var/www/miapp-api/shared/storage/framework/cache/data \
+  /var/www/miapp-api/shared/storage/framework/sessions \
+  /var/www/miapp-api/shared/storage/framework/views \
+  /var/www/miapp-api/shared/storage/logs
+```
+
+Base de datos de la app: crearla como en el paso 5.5 (usuario y base con el nombre de la app, contraseña aleatoria
+del gestor de contraseñas, `REVOKE CONNECT ... FROM PUBLIC`).
+
+Generar la `APP_KEY` (copiarla al `.env`; se muestra solo en tu terminal):
+
+```bash
+echo "base64:$(openssl rand -base64 32)"
+```
+
+Crear el `.env` de producción, **solo legible por el componente**:
+
+```bash
+sudo install -m 600 -o miapp-api -g miapp-api /dev/null /var/www/miapp-api/shared/.env
+sudo -u miapp-api nano /var/www/miapp-api/shared/.env
+```
+
+Partir del `.env.example` del proyecto y ajustar al menos:
+
+```
+APP_ENV=production
+APP_DEBUG=false
+APP_KEY=base64:...
+APP_URL=https://www.tudominio.com
+
+DB_CONNECTION=pgsql
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_DATABASE=miapp
+DB_USERNAME=miapp
+DB_PASSWORD=...
+
+SESSION_SECURE_COOKIE=true
+LOG_LEVEL=warning
+```
+
+Si el frontend es otro componente y usa Sanctum SPA, además:
+
+```
+SANCTUM_STATEFUL_DOMAINS=www.tudominio.com
+TRUSTED_PROXIES=127.0.0.1,::1
+```
+
+### 6.5 Componente Laravel: pool PHP-FPM
+
+Cada app Laravel corre con **su usuario**, en su propio socket.
+
+```bash
+sudo nano /etc/php/8.4/fpm/pool.d/miapp-api.conf
+```
+
+```
+[miapp-api]
+user = miapp-api
+group = miapp-api
+
+listen = /run/php/miapp-api.sock
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+
+; Procesos bajo demanda: no ocupa RAM si no hay visitas
+pm = ondemand
+pm.max_children = 5
+pm.process_idle_timeout = 20s
+pm.max_requests = 500
+
+; PHP no puede leer fuera de la carpeta del componente
+php_admin_value[open_basedir] = /var/www/miapp-api/:/tmp/
+security.limit_extensions = .php
+catch_workers_output = yes
+```
+
+Desactivar el pool `www` de Debian (corría como `www-data` y no se usa) **después** de crear el propio, porque
+PHP-FPM necesita al menos un pool:
+
+```bash
+sudo mv /etc/php/8.4/fpm/pool.d/www.conf /etc/php/8.4/fpm/pool.d/www.conf.disabled
+sudo php-fpm8.4 -t && sudo systemctl reload php8.4-fpm
+ls -l /run/php/
+```
+
+Debe existir `miapp-api.sock` (dueño `www-data`) y ya no `php8.4-fpm.sock`.
+
+### 6.6 Componente Laravel: vhost de nginx
+
+Común a ambos casos: **solo `index.php` se ejecuta** (cualquier otro `.php` subido por error da 404), y se usa
+`$realpath_root` para que, al cambiar el symlink `current`, PHP vea la versión nueva y no la cacheada.
+
+**Laravel interno** (detrás de un frontend Node, como en un monorepo con Next):
+
+```bash
+sudo nano /etc/nginx/sites-available/miapp-api.conf
+```
+
+```
+# Solo accesible desde el propio servidor: lo consume el componente Node
+server {
+    listen 127.0.0.1:8000;
+    server_name 127.0.0.1;
+
+    root /var/www/miapp-api/current/public;
+    index index.php;
+
+    location / { try_files $uri $uri/ /index.php?$query_string; }
+
+    location = /index.php {
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT $realpath_root;
+        fastcgi_pass unix:/run/php/miapp-api.sock;
+    }
+
+    location ~ \.php$ { return 404; }
+    location ~ /\.(?!well-known) { deny all; }
+}
+```
+
+**Laravel público** (solo Laravel, o Laravel + Vue/Inertia): el mismo contenido, pero escuchando en el 443 con
+Cloudflare:
+
+```
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name www.tudominio.com;
+
+    include snippets/cloudflare-origin.conf;
+    include snippets/security-headers.conf;
+    limit_req zone=perip burst=40 nodelay;
+
+    root /var/www/miapp/current/public;
+    # ...mismas location que el interno, con el socket de esta app
+}
+```
+
+Activar y validar:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/miapp-api.conf /etc/nginx/sites-enabled/miapp-api.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### 6.7 Componente Node SSR: servicio systemd
+
+Con Next en modo **standalone** (`output: "standalone"` en `next.config.ts`), el deploy sube solo un servidor
+mínimo (`server.js`) y la VPS no instala `node_modules`. Crear usuario y carpetas como en 6.3 (`miapp-web`, sin
+añadir `www-data` a su grupo).
+
+```bash
+sudo nano /etc/systemd/system/miapp-web.service
+```
+
+```
+[Unit]
+Description=miapp-web (Next.js)
+After=network.target
+
+[Service]
+Type=simple
+User=miapp-web
+Group=miapp-web
+WorkingDirectory=/var/www/miapp-web/current
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+
+# Límites y aislamiento
+MemoryMax=400M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`HOSTNAME=127.0.0.1` hace que Node escuche solo en local: solo nginx puede hablarle.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable miapp-web
+```
+
+(No se arranca todavía: aún no hay código. Se arranca en la prueba 6.9.)
+
+### 6.8 Componente Node SSR: vhost público
+
+Next ya pone sus propias cabeceras de seguridad (`next.config.ts`), así que aquí **no** se incluye
+`security-headers.conf` (saldrían duplicadas). Si una app no las pone, incluir el fragmento.
+
+El dominio sin `www` redirige a `www`, que es el canónico:
+
+```bash
+sudo nano /etc/nginx/sites-available/miapp-web.conf
+```
+
+```
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name tudominio.com;
+
+    include snippets/cloudflare-origin.conf;
+    return 301 https://www.tudominio.com$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name www.tudominio.com;
+
+    include snippets/cloudflare-origin.conf;
+    limit_req zone=perip burst=40 nodelay;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/miapp-web.conf /etc/nginx/sites-enabled/miapp-web.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### 6.9 Prueba con versiones de prueba
+
+Antes de tener deploys (Fase 7), una versión mínima de cada componente comprueba la cadena completa. La Fase 7 la
+reemplaza.
+
+**Laravel:** un `index.php` que dice con qué usuario corre PHP.
+
+```bash
+sudo -u miapp-api mkdir -p /var/www/miapp-api/releases/prueba/public
+echo '<?php echo posix_getpwuid(posix_geteuid())["name"], "\n";' | sudo -u miapp-api tee /var/www/miapp-api/releases/prueba/public/index.php
+sudo -u miapp-api ln -sfn releases/prueba /var/www/miapp-api/current
+curl -s http://127.0.0.1:8000/
+```
+
+Debe imprimir `miapp-api`: PHP corre con el usuario del componente, no con `www-data`.
+
+**Node:** un servidor mínimo que responde en el mismo puerto y con las mismas variables que usará Next.
+
+```bash
+sudo -u miapp-web mkdir -p /var/www/miapp-web/releases/prueba
+echo 'require("http").createServer((q,r)=>r.end("web ok\n")).listen(process.env.PORT, process.env.HOSTNAME)' | sudo -u miapp-web tee /var/www/miapp-web/releases/prueba/server.js
+sudo -u miapp-web ln -sfn releases/prueba /var/www/miapp-web/current
+sudo systemctl start miapp-web
+curl -s http://127.0.0.1:3000/
+```
+
+Debe imprimir `web ok`. **Desde tu computadora**, a través de Cloudflare:
+
+```bash
+curl -s https://www.tudominio.com/
+curl -sI https://tudominio.com/ | grep -iE '^(HTTP|location)'
+```
+
+El primero debe imprimir `web ok`; el segundo `301` con `location: https://www.tudominio.com/`.
+
+**Aislamiento** (en la VPS): el componente web no debe poder leer el `.env` de la API:
+
+```bash
+sudo -u miapp-web cat /var/www/miapp-api/shared/.env
+```
+
+Debe responder `Permission denied`.
+
+### Verificación de la Fase 6
+
+- [ ] Sin `test.conf` ni `/var/www/test`; pool `www` desactivado.
+- [ ] `curl -s http://127.0.0.1:8000/` → nombre del usuario del componente Laravel.
+- [ ] `systemctl is-active miapp-web` → `active`; `curl -s http://127.0.0.1:3000/` → `web ok`.
+- [ ] Desde fuera: `www` → `web ok`; dominio sin `www` → `301` a `www`.
+- [ ] El componente web no puede leer el `.env` de la API.
+- [ ] `sudo ss -tlnp` → 3000 y 8000 solo en `127.0.0.1`.
 
 ---
 
