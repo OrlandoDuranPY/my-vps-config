@@ -2609,6 +2609,7 @@ alerta por correo. (Los Health Checks de Cloudflare requieren plan de pago.)
 - `API_URL` y `NEXT_PUBLIC_*` de Next se fijan **al compilar**: cambiarlos exige redeploy.
 - Tras editar `shared/.env` de Laravel, `config:cache` (la config está cacheada).
 - Rollback de código **no** deshace migraciones.
+- Seeders en producción: `db:seed --force`, y solo si son idempotentes (`firstOrCreate`/`updateOrCreate`) y no usan Faker (el deploy instala sin dependencias de desarrollo). Nunca `migrate:fresh`.
 - Archivos subidos por usuarios: siempre en `shared/` (si no, se pierden en cada deploy).
 - Reiniciar Node deja unos segundos sin servicio.
 
@@ -2702,6 +2703,8 @@ Redeploy sin cambios: GitHub → `Actions → Deploy → Run workflow`.
 ```bash
 sudo -u miapp-api php /var/www/miapp-api/current/artisan about
 sudo -u miapp-api php /var/www/miapp-api/current/artisan migrate:status
+sudo -u miapp-api php /var/www/miapp-api/current/artisan db:seed --force   # seeders (--force: APP_ENV=production)
+# NUNCA migrate:fresh / migrate:refresh / db:wipe en producción: borran todas las tablas
 sudo -u miapp-api nano /var/www/miapp-api/shared/.env  # editar variables
 # Tras editar .env (la config está cacheada):
 sudo -u miapp-api php /var/www/miapp-api/current/artisan config:cache && sudo systemctl reload php8.4-fpm
