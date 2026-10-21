@@ -13,7 +13,7 @@ Cada fase registra qué se hizo, los comandos usados y cómo se verificó.
 | 5. Bases de datos | Validada |
 | 6. Estructura por app | Validada |
 | 7. Deploy (GitHub Actions) | Validada |
-| 8. Backups | Pendiente |
+| 8. Backups | Validada |
 | 9. Verificación final | Pendiente |
 
 ---
@@ -2237,6 +2237,200 @@ volver el código atrás no deshace los cambios en la base de datos.
 - [x] `sudo ls -l /var/www/miapp-*/current` apunta a la versión nueva.
 - [x] El sitio carga, el login funciona y una imagen subida **sobrevive** a un segundo deploy.
 - [x] Sin llaves privadas de deploy en tu computadora.
+
+---
+
+## Fase 8 — Backups
+
+Un solo script, lanzado por un timer diario:
+
+1. Dump de cada base de datos en `/var/backups/db/FECHA/` (se guardan 7 días en la VPS).
+2. Copia **cifrada** con [restic](https://restic.net) a Cloudflare R2: dumps, `/etc` y `/var/www/*/shared`
+   (`.env`, `storage`, `uploads`). Retención: 7 diarios, 4 semanales, 6 mensuales.
+
+El código no se respalda: está en Git y GitHub Actions lo vuelve a desplegar.
+
+> R2 tiene 10 GB gratis al mes, pero Cloudflare pide un método de pago para activarlo.
+> Cualquier S3 compatible sirve igual (por ejemplo Backblaze B2); solo cambia `RESTIC_REPOSITORY`.
+
+### 8.1 Instalar restic (en la VPS)
+
+```bash
+sudo apt install -y restic
+restic version
+```
+
+### 8.2 Bucket y token en Cloudflare R2
+
+1. `R2 Object Storage → Create bucket`: nombre (ej. `vps-backups`), ubicación automática.
+2. `R2 Object Storage → Manage API tokens → Create API token`:
+   - Permisos: **Object Read & Write**.
+   - Alcance: **solo ese bucket**.
+3. Guardar en el gestor de contraseñas: *Access Key ID*, *Secret Access Key* y el endpoint
+   `https://ID_DE_CUENTA.r2.cloudflarestorage.com` (se muestran una sola vez).
+
+### 8.3 Repositorio restic (en la VPS)
+
+Generar la contraseña del repositorio y **guardarla en el gestor de contraseñas**:
+
+```bash
+openssl rand -base64 32
+```
+
+> **Sin esta contraseña los backups no se pueden leer, ni por ti ni por nadie.** Si la VPS se pierde,
+> necesitas: contraseña de restic + llaves de R2. Guárdalas fuera de la VPS.
+
+Archivo de credenciales, solo para root:
+
+```bash
+sudo install -d -m 700 /etc/restic
+sudo install -m 600 /dev/null /etc/restic/env
+sudo nano /etc/restic/env
+```
+
+```bash
+export RESTIC_REPOSITORY="s3:https://ID_DE_CUENTA.r2.cloudflarestorage.com/vps-backups"
+export RESTIC_PASSWORD="CONTRASEÑA_DE_RESTIC"
+export AWS_ACCESS_KEY_ID="ACCESS_KEY_ID"
+export AWS_SECRET_ACCESS_KEY="SECRET_ACCESS_KEY"
+export AWS_DEFAULT_REGION="auto"
+```
+
+Crear el repositorio (cifrado) en el bucket:
+
+```bash
+sudo bash -c '. /etc/restic/env && restic init'
+```
+
+Esperado: `created restic repository ... at s3:...`.
+
+> `client.PutObject: Access Denied`: el token autentica pero no escribe. Editarlo en R2 con
+> **Object Read & Write** sobre ese bucket (las llaves no cambian).
+
+### 8.4 Script de backup (en la VPS)
+
+`sudo nano /usr/local/sbin/backup`:
+
+```bash
+#!/bin/bash
+# Backup diario: dumps de BD (7 días locales) + copia cifrada con restic.
+set -euo pipefail
+umask 077
+cd /
+DIR=/var/backups/db
+HOY=$(date -u +%F)
+install -d -m 700 "$DIR/$HOY"
+
+# PostgreSQL: roles + una copia por base de datos
+runuser -u postgres -- pg_dumpall --globals-only > "$DIR/$HOY/pg-globals.sql"
+for db in $(runuser -u postgres -- psql -Atc "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres'"); do
+  runuser -u postgres -- pg_dump -Fc "$db" > "$DIR/$HOY/pg-$db.dump"
+done
+
+# MariaDB: una copia por base de datos, sin las del sistema
+for db in $(mariadb -N -e 'SHOW DATABASES' | grep -Ev '^(information_schema|performance_schema|mysql|sys)$'); do
+  mariadb-dump --single-transaction --routines --triggers "$db" | gzip > "$DIR/$HOY/mariadb-$db.sql.gz"
+done
+
+# Retención local: 7 días
+find "$DIR" -mindepth 1 -maxdepth 1 -type d -mtime +6 -exec rm -rf {} +
+
+# Copia externa cifrada
+. /etc/restic/env
+restic backup --quiet /var/backups/db /etc /var/www/*/shared
+restic forget --quiet --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
+```
+
+```bash
+sudo chmod 700 /usr/local/sbin/backup
+```
+
+### 8.5 Timer diario (en la VPS)
+
+A las 9:00 UTC, antes del reinicio automático de las 10:00 (Fase 2).
+
+`sudo nano /etc/systemd/system/backup.service`:
+
+```ini
+[Unit]
+Description=Backup de bases de datos y archivos (restic)
+After=network-online.target postgresql.service mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/backup
+Nice=10
+IOSchedulingClass=idle
+```
+
+`sudo nano /etc/systemd/system/backup.timer`:
+
+```ini
+[Unit]
+Description=Backup diario
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 UTC
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now backup.timer
+```
+
+Primera ejecución a mano y revisión:
+
+```bash
+sudo systemctl start backup.service
+sudo journalctl -u backup.service -n 20 --no-pager
+sudo ls -l /var/backups/db/*/
+sudo bash -c '. /etc/restic/env && restic snapshots'
+```
+
+### 8.6 Probar la restauración (en la VPS)
+
+Un backup que nunca se restauró no es un backup. Repetir cada trimestre.
+
+Bajar la última copia de las bases de datos a una carpeta temporal:
+
+```bash
+sudo bash -c '. /etc/restic/env && restic restore latest --target /tmp/restore-test --include /var/backups/db'
+sudo ls -R /tmp/restore-test/var/backups/db
+```
+
+Cargar el dump de PostgreSQL en una base de prueba (cambiar `FECHA` y `miapp`):
+
+```bash
+sudo -u postgres createdb restore_test
+sudo cat /tmp/restore-test/var/backups/db/FECHA/pg-miapp.dump | sudo -u postgres pg_restore -d restore_test --no-owner
+sudo -u postgres psql -d restore_test -c '\dt'
+```
+
+Debe listar las tablas de la app. Limpiar:
+
+```bash
+sudo -u postgres dropdb restore_test
+sudo rm -rf /tmp/restore-test
+```
+
+Para un archivo concreto (ej. un `.env`): `restic restore latest --target /tmp/x --include /var/www/miapp-api/shared/.env`.
+
+### Verificación de la Fase 8
+
+- [x] `systemctl list-timers backup.timer` muestra la próxima ejecución.
+- [x] `/var/backups/db/FECHA/` tiene `pg-globals.sql` y un `.dump` por base de datos.
+- [x] `restic snapshots` muestra al menos una copia.
+- [x] La restauración de prueba lista las tablas.
+- [x] Contraseña de restic y llaves de R2 guardadas **fuera** de la VPS.
+
+> Límite conocido: root en la VPS puede borrar los backups de R2 (el token tiene escritura). Si eso preocupa,
+> activar *bucket lock* / retención en R2.
 
 ---
 
