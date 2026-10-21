@@ -16,6 +16,8 @@ Cada fase registra qué se hizo, los comandos usados y cómo se verificó.
 | 8. Backups | Validada |
 | 9. Verificación final | Validada |
 
+Qué tiene el servidor y qué tener en cuenta: [Resumen del servidor](#resumen-del-servidor). Comandos del día a día: [Comandos de referencia](#comandos-de-referencia).
+
 ---
 
 ## Fase 0 — Preparación
@@ -2573,6 +2575,173 @@ alerta por correo. (Los Health Checks de Cloudflare requieren plan de pago.)
 - [x] lynis revisado; warnings resueltos o justificados.
 - [x] HSTS activo (`strict-transport-security` en la respuesta).
 - [x] Monitor externo configurado.
+
+---
+
+## Resumen del servidor
+
+### Características
+
+| Área | Qué tiene |
+|---|---|
+| Sistema | Debian 13, ≤2 GB RAM + swap, zona horaria UTC, sysctl endurecido, journald limitado a 200 MB |
+| Acceso | SSH solo con llave ed25519, sin root, grupo `sshusers`, `LogLevel VERBOSE`, una llave por dispositivo |
+| Red | nftables `policy drop`: 22 abierto, 443 **solo** desde IPs de Cloudflare (lista actualizada cada semana); firewall del proveedor como segunda capa |
+| Anti fuerza bruta | fail2ban en SSH |
+| Parches | unattended-upgrades diario + reinicio automático a las 10:00 UTC si hace falta; needrestart reinicia servicios |
+| Cloudflare | Proxy, SSL Full (Strict) con Origin CA (15 años), Authenticated Origin Pulls (mTLS), TLS ≥1.2, Always HTTPS, HSTS, WAF de rutas sensibles, rate limit en login, Bot Fight Mode |
+| Web | nginx 1.26: IP real del visitante, cabeceras de seguridad, `limit_req`, servidor por defecto que rechaza dominios desconocidos |
+| Lenguajes | PHP 8.4 FPM (pool por app, `open_basedir`, opcache) + Composer · Node 24 LTS · Python 3.13 |
+| Bases de datos | PostgreSQL 17 y MariaDB 11.8, solo localhost, un usuario y una base por app; acceso remoto por túnel SSH |
+| Apps | Un usuario Linux por componente, versiones en `releases/` con `current` atómico; Node como servicio systemd en 127.0.0.1 |
+| Deploy | GitHub Actions compila y sube por rsync; llaves con `restrict`, sudo limitado a un comando; conserva 5 versiones |
+| Backups | Diario 09:00 UTC: dumps (7 días locales) + restic cifrado en R2 (7 diarios, 4 semanales, 6 mensuales) |
+| Monitoreo | Monitor HTTPS externo cada 5 min con alerta por correo |
+
+### Consideraciones
+
+**Capacidad**
+- Con 2 GB caben 2–3 apps. Vigilar `free -h` al añadir una; si un motor de BD sobra, quitarlo libera ~300 MB.
+- Cada app Node SSR usa 100–250 MB; cada pool PHP hasta ~300 MB bajo carga.
+
+**Deploy**
+- Nunca editar código en la VPS: el siguiente deploy lo pisa. Todo cambio va por Git.
+- `API_URL` y `NEXT_PUBLIC_*` de Next se fijan **al compilar**: cambiarlos exige redeploy.
+- Tras editar `shared/.env` de Laravel, `config:cache` (la config está cacheada).
+- Rollback de código **no** deshace migraciones.
+- Archivos subidos por usuarios: siempre en `shared/` (si no, se pierden en cada deploy).
+- Reiniciar Node deja unos segundos sin servicio.
+
+**Seguridad**
+- Secretos (llaves privadas, `.env`, contraseña de restic, llaves de R2, Origin CA) solo en el gestor de contraseñas, nunca en Git ni en chats.
+- Sin contraseña de restic los backups son ilegibles.
+- Root en la VPS puede borrar los backups de R2 (activar bucket lock si preocupa).
+- HSTS no se puede revertir para visitantes durante el Max Age.
+- No abrir puertos nuevos en nftables ni en el firewall del proveedor sin necesidad; servicios internos siempre en 127.0.0.1.
+- Dispositivo perdido: borrar su línea en `~/.ssh/authorized_keys`.
+- Node (NodeSource) **no** se actualiza solo: `apt full-upgrade` mensual.
+
+**Nueva app**
+- Seguir Fase 6 (usuario, carpetas, BD, pool/servicio, vhost) y Fase 7 (llaves, sudoers, secrets, workflow).
+- Backups: no hay que tocar nada, ya incluyen `/var/www/*/shared` y todas las bases de datos.
+- Crear el registro DNS **proxied** (nube naranja) en Cloudflare; sin proxy, el firewall lo bloquea.
+
+**Fechas**
+- Trimestral: probar restauración (8.6), revisar usuarios y llaves, lynis.
+- Nov 2029: caduca la CA de Authenticated Origin Pulls.
+- El Origin CA dura 15 años desde su emisión.
+
+---
+
+## Comandos de referencia
+
+Resumen de lo que se usa en el día a día. `miapp-api` / `miapp-web` = usuarios de cada componente (Fase 6).
+Salvo que se indique, todo va **en la VPS**.
+
+### Conexión (en tu computadora)
+
+```bash
+ssh vps                                                         # entrar (alias de ~/.ssh/config)
+ssh-add ~/.ssh/id_ed25519                                       # cargar la llave en el agente
+ssh -N -L 15432:127.0.0.1:5432 -L 13306:127.0.0.1:3306 vps      # túnel a las BD (localhost:15432 / 13306)
+```
+
+### Estado general
+
+```bash
+systemctl --failed                    # servicios caídos
+sudo journalctl -p err -b             # errores desde el último arranque
+free -h && df -h                      # RAM y disco
+uptime -s                             # desde cuándo está encendida
+systemctl list-timers                 # tareas programadas (backup, cloudflare-ips, apt)
+sudo ss -tlnp                         # puertos escuchando
+```
+
+### Servicios
+
+```bash
+sudo systemctl status nginx php8.4-fpm postgresql mariadb miapp-web
+sudo nginx -t && sudo systemctl reload nginx           # tras editar un vhost
+sudo php-fpm8.4 -t && sudo systemctl reload php8.4-fpm  # tras editar un pool
+sudo systemctl restart miapp-web                       # reiniciar una app Node
+sudo journalctl -u miapp-web -n 50 --no-pager          # logs de una app Node
+```
+
+### Logs
+
+```bash
+sudo tail -f /var/log/nginx/access.log /var/log/nginx/error.log
+sudo tail -n 50 /var/www/miapp-api/shared/storage/logs/laravel.log
+sudo journalctl -u ssh -n 30 --no-pager                # quién entró por SSH (y con qué llave)
+```
+
+### Firewall y fail2ban
+
+```bash
+sudo nft list ruleset | head -40                       # reglas activas
+sudo /usr/local/sbin/cloudflare-ips                    # refrescar IPs de Cloudflare a mano
+sudo fail2ban-client status sshd                       # IPs bloqueadas
+sudo fail2ban-client set sshd unbanip 203.0.113.5      # desbloquear una IP
+```
+
+### Deploy y rollback
+
+```bash
+sudo ls -1t /var/www/miapp-web/releases/               # versiones (la primera es la activa)
+sudo readlink /var/www/miapp-*/current                 # a qué versión apunta cada componente
+# Rollback de Node
+sudo -u miapp-web ln -sfn releases/VERSION /var/www/miapp-web/current && sudo systemctl restart miapp-web
+# Rollback de Laravel (ojo: no deshace migraciones)
+sudo -u miapp-api ln -sfn releases/VERSION /var/www/miapp-api/current && sudo systemctl reload php8.4-fpm
+```
+
+Redeploy sin cambios: GitHub → `Actions → Deploy → Run workflow`.
+
+### Laravel
+
+```bash
+sudo -u miapp-api php /var/www/miapp-api/current/artisan about
+sudo -u miapp-api php /var/www/miapp-api/current/artisan migrate:status
+sudo -u miapp-api nano /var/www/miapp-api/shared/.env  # editar variables
+# Tras editar .env (la config está cacheada):
+sudo -u miapp-api php /var/www/miapp-api/current/artisan config:cache && sudo systemctl reload php8.4-fpm
+```
+
+### Bases de datos
+
+```bash
+sudo -u postgres psql                                  # consola PostgreSQL
+sudo -u postgres psql -c '\l'                          # listar bases
+sudo mariadb                                           # consola MariaDB
+sudo mariadb -e 'SHOW DATABASES'
+```
+
+### Backups
+
+```bash
+sudo systemctl start backup.service                    # backup ahora
+sudo journalctl -u backup.service -n 20 --no-pager     # resultado del último
+sudo ls -l /var/backups/db/*/                          # dumps locales
+sudo bash -c '. /etc/restic/env && restic snapshots'   # copias en R2
+sudo bash -c '. /etc/restic/env && restic restore latest --target /tmp/x --include RUTA'
+```
+
+### Actualizaciones
+
+```bash
+sudo apt update && apt list --upgradable
+sudo apt full-upgrade                                  # incluye Node (NodeSource no se actualiza solo)
+ls /var/run/reboot-required 2>/dev/null && echo "reinicio pendiente"
+sudo grep -E 'Packages that will|No packages|ERROR' /var/log/unattended-upgrades/unattended-upgrades.log | tail -n 5
+```
+
+### Verificación rápida (en tu computadora)
+
+```bash
+curl -sI https://www.tudominio.com | head -1                                  # HTTP/2 200
+curl -sk -m 5 -o /dev/null -w '%{http_code}\n' https://IP_DE_LA_VPS          # 000 (firewall)
+curl -sI https://www.tudominio.com | grep -i strict-transport                 # HSTS
+```
 
 ---
 
