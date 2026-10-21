@@ -14,7 +14,7 @@ Cada fase registra qué se hizo, los comandos usados y cómo se verificó.
 | 6. Estructura por app | Validada |
 | 7. Deploy (GitHub Actions) | Validada |
 | 8. Backups | Validada |
-| 9. Verificación final | Pendiente |
+| 9. Verificación final | Validada |
 
 ---
 
@@ -2431,6 +2431,148 @@ Para un archivo concreto (ej. un `.env`): `restic restore latest --target /tmp/x
 
 > Límite conocido: root en la VPS puede borrar los backups de R2 (el token tiene escritura). Si eso preocupa,
 > activar *bucket lock* / retención en R2.
+
+---
+
+## Fase 9 — Verificación final y mantenimiento
+
+Repaso de todo lo anterior con comandos que lo demuestran, auditoría con lynis y HSTS.
+
+### 9.1 SSH (en la VPS y en tu computadora)
+
+```bash
+sudo sshd -T | grep -E '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|allowgroups) '
+```
+
+Esperado: `permitrootlogin no`, `passwordauthentication no`, `kbdinteractiveauthentication no`, `allowgroups sshusers`.
+
+Desde tu computadora, forzar contraseña debe fallar:
+
+```bash
+ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password admin@IP_DE_LA_VPS
+```
+
+Esperado: `Permission denied (publickey).`
+
+### 9.2 Puertos y firewall (en la VPS y en tu computadora)
+
+```bash
+sudo ss -tlnp | grep -v '127.0.0.1\|\[::1\]'
+```
+
+Esperado: solo `:22` y `:443` escuchando hacia fuera.
+
+Desde tu computadora, la IP directa no debe responder HTTPS (el firewall solo deja pasar a Cloudflare):
+
+```bash
+curl -sk -m 5 -o /dev/null -w '%{http_code}\n' https://IP_DE_LA_VPS
+```
+
+Esperado: `000` tras 5 segundos.
+
+### 9.3 Bases de datos solo locales (en la VPS)
+
+```bash
+sudo ss -tlnp | grep -E ':5432|:3306'
+```
+
+Esperado: solo `127.0.0.1` (o `[::1]`).
+
+### 9.4 fail2ban y parches (en la VPS)
+
+```bash
+sudo fail2ban-client status sshd
+systemctl list-timers apt-daily-upgrade.timer
+sudo tail -n 5 /var/log/unattended-upgrades/unattended-upgrades.log
+```
+
+Esperado: jail `sshd` activa (con `Total banned` mayor que 0 si ya hubo bots), el timer programado y el log
+con ejecuciones recientes sin errores.
+
+### 9.5 Auditoría con lynis (en la VPS)
+
+```bash
+sudo apt install -y lynis
+sudo lynis audit system --quick 2>/dev/null | tail -n 25
+sudo grep -E '^(warning|suggestion)\[\]' /var/log/lynis-report.dat
+```
+
+Revisar **warnings** primero. Falsos positivos conocidos en Debian 13:
+
+- `PKGS-7388` (sin repositorio de seguridad): lynis no lee el formato `.sources`. Comprobar con
+  `grep -h '^Suites' /etc/apt/sources.list.d/*.sources` que aparece `trixie-security`.
+- `FIRE-4512` (iptables sin reglas): el firewall es nftables.
+- `DBS-1828` (configuración de PostgreSQL legible): permisos por defecto de Debian, sin contraseñas dentro.
+
+`PKGS-7392` (paquetes vulnerables) sí es real: `apt list --upgradable` y actualizar.
+
+Sugerencias aplicadas:
+
+```bash
+# Purgar restos de paquetes desinstalados (líneas 'rc')
+dpkg -l | grep '^rc'
+sudo apt purge -y NOMBRE_DEL_PAQUETE
+# SSH: registrar qué llave entra en cada conexión
+echo 'LogLevel VERBOSE' | sudo tee -a /etc/ssh/sshd_config.d/00-hardening.conf
+sudo sshd -t && sudo systemctl reload ssh
+# Bloquear protocolos de red que no se usan
+printf 'install %s /bin/false\n' dccp sctp rds tipc | sudo tee /etc/modprobe.d/disable-protocols.conf
+```
+
+Descartadas: contraseña de GRUB, particiones separadas, USB/firewire, banners legales, auditd, antivirus,
+cambiar el puerto SSH, caducidad de contraseñas (no hay login por contraseña) y `AllowTcpForwarding no`
+(rompe el túnel a las bases de datos de la Fase 5).
+
+ Las sugerencias no son obligatorias: muchas no aplican a un servidor detrás de
+Cloudflare (ej. particiones separadas, malware scanners, `auditd`). Aplicar solo las que tengan sentido y
+anotar aquí cuáles se descartaron y por qué.
+
+### 9.6 HSTS en Cloudflare
+
+Solo cuando todo el sitio funciona por HTTPS (ya verificado). `SSL/TLS → Edge Certificates → HTTP Strict Transport Security`:
+
+| Opción | Valor |
+|---|---|
+| Enable HSTS | On |
+| Max Age | 6 months |
+| Apply HSTS policy to subdomains | On **solo** si todos los subdominios van por HTTPS |
+| Preload | Off (difícil de revertir; activar más adelante si se quiere) |
+| No-Sniff header | On |
+
+> Una vez activo, los navegadores **recuerdan** usar solo HTTPS durante el Max Age. Desactivarlo en Cloudflare
+> no lo revierte para quien ya visitó el sitio.
+
+Verificar desde tu computadora:
+
+```bash
+curl -sI https://www.tudominio.com | grep -i strict-transport
+```
+
+Esperado: `strict-transport-security: max-age=15552000...`.
+
+### 9.7 Monitoreo externo
+
+Cuenta gratuita en UptimeRobot (o similar): monitor HTTPS a `https://www.tudominio.com` cada 5 minutos,
+alerta por correo. (Los Health Checks de Cloudflare requieren plan de pago.)
+
+### Rutina de mantenimiento
+
+| Cuándo | Qué |
+|---|---|
+| Semanal | `systemctl --failed`, `sudo journalctl -p err -b`, `sudo fail2ban-client status sshd` |
+| Mensual | `sudo apt update && sudo apt full-upgrade` (Node de NodeSource **no** entra en los parches automáticos), `df -h`, `free -h`, `restic snapshots` |
+| Trimestral | Prueba de restauración (8.6), revisar usuarios y `authorized_keys`, `sudo lynis audit system` |
+| Nov 2029 | Renovar CA de Authenticated Origin Pulls (Fase 0) |
+
+### Verificación de la Fase 9
+
+- [x] SSH: sin root, sin contraseñas, solo `sshusers`.
+- [x] Solo 22 y 443 abiertos; la IP directa no responde HTTPS.
+- [x] Bases de datos solo en localhost.
+- [x] fail2ban activo; parches automáticos funcionando.
+- [x] lynis revisado; warnings resueltos o justificados.
+- [x] HSTS activo (`strict-transport-security` en la respuesta).
+- [x] Monitor externo configurado.
 
 ---
 
